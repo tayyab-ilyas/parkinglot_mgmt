@@ -14,7 +14,7 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import app.models  # noqa: E402,F401
-from app import seed  # noqa: E402
+from app import cache, seed  # noqa: E402
 from app.db import Base, engine  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -24,6 +24,7 @@ def fresh_db():
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     seed.main()
+    cache.clear()  # the database was rebuilt; cached responses from the last test are stale
 
 
 def login(username: str, password: str) -> TestClient:

@@ -5,6 +5,7 @@ from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app import cache
 from app.db import Base
 
 
@@ -21,5 +22,7 @@ class AuditLog(Base):
 
 
 def record(db, actor_id: int | None, action: str, entity: str, entity_id: int, **data) -> None:
-    """Add to the caller's transaction, so the audit row commits or rolls back with the change."""
+    """Add to the caller's transaction, so the audit row commits or rolls back with the change.
+    Every write passes through here, so this is also where it marks the cached reads it makes stale."""
+    cache.mark_write(db, entity)
     db.add(AuditLog(actor_id=actor_id, action=action, entity=entity, entity_id=entity_id, data=jsonable_encoder(data)))

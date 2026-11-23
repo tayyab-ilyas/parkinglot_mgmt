@@ -7,6 +7,7 @@ from fastapi import Cookie, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app import cache
 from app.db import get_db
 from app.enums import Role
 from app.errors import AppError
@@ -46,11 +47,12 @@ def admin_only(user: User = Depends(current_user)) -> User:
     return user
 
 
-def allowed_lot_ids(db: Session, user: User) -> set[int] | None:
-    """None means every lot (admin)."""
+def allowed_lot_ids(db: Session, user: User) -> frozenset[int] | None:
+    """None means every lot (admin). Cached per user; PUT /users/{id}/lots clears it on commit."""
     if user.role == Role.ADMIN:
         return None
-    return set(db.scalars(select(user_lots.c.lot_id).where(user_lots.c.user_id == user.id)))
+    q = select(user_lots.c.lot_id).where(user_lots.c.user_id == user.id)
+    return cache.get_or_set(("users", "access", user.id), lambda: frozenset(db.scalars(q)))
 
 
 def ensure_lot_access(db: Session, user: User, lot_id: int) -> None:

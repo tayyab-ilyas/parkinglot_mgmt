@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
+from app import cache
 from app.auth import admin_only, current_user, ensure_lot_access
 from app.db import get_db
 from app.enums import SpotState
@@ -93,8 +94,13 @@ def _range(from_date: date, to_date: date) -> None:
 
 @router.get("/lots/{lot_id}/analytics", dependencies=[Depends(admin_only)])
 def analytics(lot_id: int, from_date: date, to_date: date, db: Session = Depends(get_db)):
-    """Everything in the lot's local days. Entries count by entry time, revenue by payment time."""
+    """Everything in the lot's local days. Entries count by entry time, revenue by payment time.
+    Cached in "reports": the range numbers may trail a fresh checkout by up to a minute."""
     _range(from_date, to_date)
+    return cache.get_or_set(("reports", "analytics", lot_id, from_date, to_date), lambda: _analytics(db, lot_id, from_date, to_date))
+
+
+def _analytics(db: Session, lot_id: int, from_date: date, to_date: date) -> dict:
     lot = get_or_404(db, Lot, lot_id, "lot")
     p = {"lot_id": lot_id, "tz": lot.timezone, "from_date": from_date, "to_date": to_date}
     revenue = dict(db.execute(REVENUE_BY_VEHICLE, p).all())
@@ -117,18 +123,22 @@ def parked_now(lot_id: int, db: Session = Depends(get_db), user: User = Depends(
     """Vehicles parked right now, by vehicle type and the spot size they occupy."""
     ensure_lot_access(db, user, lot_id)
     matrix = text(MATRIX.text.format(where="t.status = 'OPEN'"))
-    return [dict(r) for r in db.execute(matrix, {"lot_id": lot_id}).mappings()]
+    return cache.get_or_set(("live", "parked", lot_id), lambda: [dict(r) for r in db.execute(matrix, {"lot_id": lot_id}).mappings()])
 
 
 @router.get("/reports/overview", dependencies=[Depends(admin_only)])
 def overview(db: Session = Depends(get_db)):
     """One row per lot: capacity, occupancy and today's numbers in the lot's own timezone."""
-    return [dict(r) for r in db.execute(OVERVIEW).mappings()]
+    return cache.get_or_set(("live", "overview"), lambda: [dict(r) for r in db.execute(OVERVIEW).mappings()])
 
 
 @router.get("/lots/{lot_id}/occupancy")
 def occupancy(lot_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     ensure_lot_access(db, user, lot_id)
+    return cache.get_or_set(("live", "occupancy", lot_id), lambda: _occupancy(db, lot_id))
+
+
+def _occupancy(db: Session, lot_id: int) -> list[dict]:
     count = lambda state: func.count().filter(Spot.state == state)  # noqa: E731
     rows = db.execute(
         select(
@@ -148,13 +158,24 @@ def occupancy(lot_id: int, db: Session = Depends(get_db), user: User = Depends(c
 def revenue(lot_id: int, from_date: date, to_date: date, db: Session = Depends(get_db)):
     """Per local calendar day in the lot's timezone; amounts in minor units."""
     _range(from_date, to_date)
-    rows = db.execute(REVENUE, {"lot_id": lot_id, "from_date": from_date, "to_date": to_date}).mappings()
-    return [dict(r) for r in rows]
+    p = {"lot_id": lot_id, "from_date": from_date, "to_date": to_date}
+    return cache.get_or_set(("reports", "revenue", lot_id, from_date, to_date), lambda: [dict(r) for r in db.execute(REVENUE, p).mappings()])
+
+
+@router.get("/cache", dependencies=[Depends(admin_only)])
+def cache_view():
+    """Inspect the in-process response cache: entries with seconds left, and hits/misses/clears per area."""
+    return cache.snapshot()
 
 
 @router.get("/audit-logs", dependencies=[Depends(admin_only)])
 def audit_logs(entity: str | None = None, entity_id: int | None = None, limit: int = 100, db: Session = Depends(get_db)):
-    q = select(AuditLog).order_by(AuditLog.id.desc()).limit(min(limit, 500))
+    limit = min(limit, 500)
+    return cache.get_or_set(("audit", entity, entity_id, limit), lambda: _audit_logs(db, entity, entity_id, limit))
+
+
+def _audit_logs(db: Session, entity: str | None, entity_id: int | None, limit: int) -> list[dict]:
+    q = select(AuditLog).order_by(AuditLog.id.desc()).limit(limit)
     if entity:
         q = q.where(AuditLog.entity == entity)
     if entity_id is not None:

@@ -119,6 +119,9 @@ docker compose exec api python -m pytest -q
 | `tests/test_pricing.py` | Fee maths: grace period, hour rounding, 24 h cap, multi-day stays, lost ticket, breakdown lines |
 | `tests/test_parking.py` | 50 parallel entries into 10 spots, same-plate race, upsizing, lot full, entry → quote → checkout, lost ticket, lot scoping, occupied spot, pricing supersede, revenue |
 | `tests/test_reporting.py` | Rate card, fee breakdown on quotes, analytics, live vehicle × size mix, cross-lot overview, adding and disabling lots |
+| `tests/test_integration.py` | Cross-module flows over HTTP: new lot from setup to paid exit, login/logout, deactivated user locked out, lot reassignment, input errors, no price set, closed level skipped, price change not touching parked cars |
+| `tests/test_cache_unit.py` | The cache store alone, on a fake clock: hits, TTL expiry, errors not cached, prefix clears, overlapping write, eviction, write-to-area map, stats, parallel readers |
+| `tests/test_cache.py` | The cache through the app: rollback vs commit, rate card after publish, live counts after entry and checkout, fresh fee on a cached ticket, `/api/cache` |
 
 The frontend has no unit tests; `npm run build` type-checks it with `tsc`.
 
@@ -246,7 +249,7 @@ backend/
       payments/               Payment model, PaymentGateway interface, DummyGateway
       reporting/              occupancy, analytics, live mix, overview, revenue, audit log
       audit/                  AuditLog model and record()
-  tests/                      conftest.py, test_pricing.py, test_parking.py, test_reporting.py
+  tests/                      conftest.py, test_pricing.py, test_parking.py, test_reporting.py, test_integration.py, test_cache*.py
 frontend/
   Dockerfile, nginx.conf
   index.html                  fonts, root element
@@ -298,6 +301,7 @@ Money is always an integer in minor units (paise). Full interactive docs: http:/
 | PATCH | `/users/{id}` | admin | Password, role, active |
 | PUT | `/users/{id}/lots` | admin | Set an attendant's lots (`[lotId, ...]`) |
 | GET | `/audit-logs?entity=&entity_id=&limit=` | admin | Latest changes |
+| GET | `/cache` | admin | Cache contents (keys, seconds left) and hits/misses/clears per area |
 | GET | `/health` | public | Liveness |
 
 ## 11. How fees are calculated
@@ -335,6 +339,13 @@ between, the server answers `FEE_CHANGED` with the new amount instead of chargin
 - **Cameras, barriers, reservations:** new callers of `issue_ticket` and `checkout`; `SpotState` can gain `RESERVED`.
 - **Analytics at scale:** queries scan a lot's tickets in the chosen window. Add a daily rollup table when one
   lot passes about a million tickets a year (`shortcut:` comment in `reporting/router.py`).
+- **Response cache:** `app/cache.py` is an in-process store that caches every GET endpoint. Keys start with an
+  area (`live`, `tickets`, `reports`, `audit`, `places`, `rates`, `pricing`, `users`) that sets its TTL. Every
+  write already calls `audit.record()`, which marks the areas it affects; they are cleared right after the commit
+  (a rollback clears nothing). Analytics and revenue are not cleared by ticket writes and can trail by up to 60 s.
+  Ticket lookups cache the stored ticket, but the fee is always computed fresh, and the spot claim, checkout and
+  login never touch the cache. Writes made outside the API (`--history`, psql) show up when the TTL runs out.
+  It lives in one API process; with several workers or servers, move it to Redis.
 - **Not built yet:** login rate limiting, refunds, an in-app theme switch, frontend unit tests.
 
 List every deferred shortcut with: `grep -rn "shortcut:" backend frontend/src`.

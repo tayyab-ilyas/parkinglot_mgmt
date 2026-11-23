@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from app import cache
 from app.auth import admin_only, allowed_lot_ids, current_user
 from app.db import get_db
 from app.enums import SpotSize, SpotState
@@ -127,7 +128,8 @@ def _create(db: Session, user: User, obj, entity: str):
 # --- Cities ---
 @router.get("/cities", response_model=list[CityOut], dependencies=admin)
 def list_cities(db: Session = Depends(get_db)):
-    return db.scalars(select(City).order_by(City.name)).all()
+    q = select(City).order_by(City.name)
+    return cache.get_or_set(("places", "cities"), lambda: [CityOut.model_validate(c).model_dump() for c in db.scalars(q)])
 
 
 @router.post("/cities", response_model=CityOut, status_code=201)
@@ -144,6 +146,11 @@ def update_city(city_id: int, body: CityPatch, db: Session = Depends(get_db), us
 @router.get("/lots")
 def list_lots(city_id: int | None = None, db: Session = Depends(get_db), user: User = Depends(current_user)):
     """Lots the caller may work in, with live free-spot counts."""
+    ids = allowed_lot_ids(db, user)
+    return cache.get_or_set(("live", "lots", ids, city_id), lambda: _list_lots(db, ids, city_id))
+
+
+def _list_lots(db: Session, ids: frozenset[int] | None, city_id: int | None) -> list[dict]:
     free = (
         select(Spot.lot_id, func.count().label("free"))
         .join(Level, Level.id == Spot.level_id)
@@ -159,7 +166,6 @@ def list_lots(city_id: int | None = None, db: Session = Depends(get_db), user: U
     )
     if city_id is not None:
         q = q.where(Lot.city_id == city_id)
-    ids = allowed_lot_ids(db, user)
     if ids is not None:
         q = q.where(Lot.id.in_(ids))
     return [
@@ -182,7 +188,8 @@ def update_lot(lot_id: int, body: LotPatch, db: Session = Depends(get_db), user:
 # --- Levels ---
 @router.get("/lots/{lot_id}/levels", response_model=list[LevelOut], dependencies=admin)
 def list_levels(lot_id: int, db: Session = Depends(get_db)):
-    return db.scalars(select(Level).where(Level.lot_id == lot_id).order_by(Level.ordinal)).all()
+    q = select(Level).where(Level.lot_id == lot_id).order_by(Level.ordinal)
+    return cache.get_or_set(("places", "levels", lot_id), lambda: [LevelOut.model_validate(x).model_dump() for x in db.scalars(q)])
 
 
 @router.post("/lots/{lot_id}/levels", response_model=LevelOut, status_code=201)
@@ -199,7 +206,8 @@ def update_level(level_id: int, body: LevelPatch, db: Session = Depends(get_db),
 # --- Spots ---
 @router.get("/levels/{level_id}/spots", response_model=list[SpotOut], dependencies=admin)
 def list_spots(level_id: int, db: Session = Depends(get_db)):
-    return db.scalars(select(Spot).where(Spot.level_id == level_id).order_by(Spot.code)).all()
+    q = select(Spot).where(Spot.level_id == level_id).order_by(Spot.code)
+    return cache.get_or_set(("places", "spots", level_id), lambda: [SpotOut.model_validate(s).model_dump() for s in db.scalars(q)])
 
 
 @router.post("/levels/{level_id}/spots", response_model=list[SpotOut], status_code=201)

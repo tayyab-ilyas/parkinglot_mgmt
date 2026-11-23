@@ -1,6 +1,7 @@
 import re
 import secrets
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import ensure_lot_access
 from app.enums import COMPATIBLE_SIZES, SpotState, TicketStatus, VehicleType
-from app.errors import AppError, get_or_404, not_found
+from app.errors import AppError, get_or_404
 from app.modules.audit.models import record
 from app.modules.identity.models import User
 from app.modules.locations.models import Level, Lot, Spot
@@ -17,6 +18,7 @@ from app.modules.payments.models import Payment
 from app.modules.pricing import service as pricing
 from app.modules.pricing.models import PricingRule
 from app.modules.parking.models import Ticket
+from app.modules.parking.repository import TicketDB, TicketStore
 
 CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32: no I, L, O, U
 
@@ -43,34 +45,6 @@ def normalize_plate(raw: str) -> str:
 
 def new_code() -> str:
     return "".join(secrets.choice(CODE_ALPHABET) for _ in range(10))
-
-
-def _views(db: Session, *where) -> list[dict]:
-    q = (
-        select(Ticket, Spot.code, Level.name, Lot.currency)
-        .join(Spot, Spot.id == Ticket.spot_id)
-        .join(Level, Level.id == Spot.level_id)
-        .join(Lot, Lot.id == Ticket.lot_id)
-        .where(*where)
-        .order_by(Ticket.entry_at.desc())
-        .limit(200)
-    )
-    return [
-        {
-            "code": t.code,
-            "lot_id": t.lot_id,
-            "plate": t.plate,
-            "vehicle_type": t.vehicle_type,
-            "spot_code": spot_code,
-            "level_name": level_name,
-            "currency": currency,
-            "entry_at": t.entry_at,
-            "exit_at": t.exit_at,
-            "status": t.status,
-            "lost": t.lost,
-        }
-        for t, spot_code, level_name, currency in db.execute(q)
-    ]
 
 
 def _lot_full(db: Session, lot: Lot, vehicle_type: VehicleType) -> AppError:
@@ -143,48 +117,36 @@ def issue_ticket(db: Session, user: User, lot_id: int, raw_plate: str, vehicle_t
             raise AppError(409, "VEHICLE_ALREADY_PARKED", f"{plate} already has an open ticket")
         raise
     record(db, user.id, "ticket.issue", "ticket", ticket.id, code=ticket.code, plate=plate, spot_id=spot_id)
-    db.commit()
-    return _views(db, Ticket.id == ticket.id)[0]
-
-
-def _find_ticket(db: Session, user: User, code: str, lock: bool = False) -> Ticket:
-    q = select(Ticket).where(Ticket.code == code.strip().upper())
-    ticket = db.scalar(q.with_for_update() if lock else q)
-    if ticket is None:
-        raise not_found("ticket")
-    ensure_lot_access(db, user, ticket.lot_id)
-    return ticket
+    db.commit()  # also clears the cached ticket reads (cache.mark_write via record)
+    return TicketDB(db).view(ticket.id)
 
 
 def get_ticket(db: Session, user: User, code: str, lost: bool = False) -> dict:
-    """Ticket plus the fee if it were checked out now."""
-    ticket = _find_ticket(db, user, code)
-    view = _views(db, Ticket.id == ticket.id)[0]
+    """Ticket plus the fee if it were checked out now. The ticket comes through the cache; the fee never does."""
+    view = dict(TicketStore(db).find(code.strip().upper()))  # copy: never edit the cached dict
+    ensure_lot_access(db, user, view["lot_id"])
+    paid = view.pop("paid", None)
     now = datetime.now(UTC)
     view["quoted_at"] = now
-    rule = db.get(PricingRule, ticket.pricing_rule_id)
-    view["rule"] = pricing.rule_view(rule)  # the tariff locked in at entry
-    if ticket.status == TicketStatus.OPEN:
-        view |= pricing.fee_breakdown(rule, ticket.entry_at, now, lost)
+    rule = SimpleNamespace(**view["rule"])
+    if view["status"] == TicketStatus.OPEN:
+        view |= pricing.fee_breakdown(rule, view["entry_at"], now, lost)
     else:
-        view |= pricing.fee_breakdown(rule, ticket.entry_at, ticket.exit_at, ticket.lost)
-        view["amount"] = db.scalar(select(Payment.amount).where(Payment.ticket_id == ticket.id))
+        view |= pricing.fee_breakdown(rule, view["entry_at"], view["exit_at"], view["lost"])
+        view["amount"] = paid
     return view
 
 
 def list_tickets(db: Session, user: User, lot_id: int, plate: str | None, status: TicketStatus | None) -> list[dict]:
     ensure_lot_access(db, user, lot_id)
-    where = [Ticket.lot_id == lot_id]
-    if plate:
-        where.append(Ticket.plate.contains(re.sub(r"[^A-Z0-9]", "", plate.upper())))
-    if status:
-        where.append(Ticket.status == status)
-    return _views(db, *where)
+    plate = re.sub(r"[^A-Z0-9]", "", plate.upper()) if plate else None
+    return TicketStore(db).search(lot_id, plate, status)
 
 
 def checkout(db: Session, user: User, code: str, expected_amount: int, lost: bool) -> dict:
-    """Pay, close the ticket and free the spot in one transaction."""
-    ticket = _find_ticket(db, user, code, lock=True)
+    """Pay, close the ticket and free the spot in one transaction. Straight to the DB: never cached."""
+    ticket = TicketDB(db).lock(code.strip().upper())
+    ensure_lot_access(db, user, ticket.lot_id)
     if ticket.status != TicketStatus.OPEN:
         raise AppError(409, "TICKET_CLOSED", "This ticket is already checked out")
     now = datetime.now(UTC)
@@ -204,5 +166,5 @@ def checkout(db: Session, user: User, code: str, expected_amount: int, lost: boo
     ticket.status, ticket.exit_at, ticket.lost, ticket.closed_by = TicketStatus.CLOSED, now, lost, user.id
     db.execute(update(Spot).where(Spot.id == ticket.spot_id).values(state=SpotState.FREE))
     record(db, user.id, "ticket.checkout", "ticket", ticket.id, amount=amount, lost=lost, gateway_ref=ref)
-    db.commit()
-    return {**_views(db, Ticket.id == ticket.id)[0], "amount": amount, "gateway_ref": ref}
+    db.commit()  # also clears the cached ticket reads (cache.mark_write via record)
+    return {**TicketDB(db).view(ticket.id), "amount": amount, "gateway_ref": ref}

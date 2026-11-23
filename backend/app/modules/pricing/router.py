@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app import cache
 from app.auth import admin_only, current_user, ensure_lot_access
 from app.db import get_db
 from app.enums import COMPATIBLE_SIZES, VehicleType
@@ -21,7 +22,11 @@ rates_router = APIRouter(tags=["pricing"])
 @rates_router.get("/lots/{lot_id}/rates")
 def rate_card(lot_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     """The public tariff: current rule per vehicle type and the spot sizes each may use, in preference order."""
-    ensure_lot_access(db, user, lot_id)
+    ensure_lot_access(db, user, lot_id)  # outside the cache: access is per user, the card is per lot
+    return cache.get_or_set(("rates", lot_id), lambda: _rate_card(db, lot_id))
+
+
+def _rate_card(db: Session, lot_id: int) -> dict:
     get_or_404(db, Lot, lot_id, "lot")
     rules = db.scalars(
         select(PricingRule).where(PricingRule.lot_id == lot_id, PricingRule.retired_at.is_(None))
@@ -50,11 +55,11 @@ class RuleOut(RuleIn):
 
 @router.get("/lots/{lot_id}/pricing-rules", response_model=list[RuleOut])
 def list_rules(lot_id: int, db: Session = Depends(get_db)):
-    return db.scalars(
-        select(PricingRule).where(PricingRule.lot_id == lot_id).order_by(PricingRule.created_at.desc())
-    ).all()
+    q = select(PricingRule).where(PricingRule.lot_id == lot_id).order_by(PricingRule.created_at.desc())
+    return cache.get_or_set(("pricing", lot_id), lambda: [RuleOut.model_validate(r).model_dump() for r in db.scalars(q)])
 
 
+# Both writes clear "rates" and "pricing" after commit, through audit.record (see app/cache.py).
 @router.post("/lots/{lot_id}/pricing-rules", response_model=RuleOut, status_code=201)
 def create_rule(lot_id: int, body: RuleIn, db: Session = Depends(get_db), user: User = Depends(admin_only)):
     get_or_404(db, Lot, lot_id, "lot")

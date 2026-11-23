@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, insert, select
 from sqlalchemy.orm import Session
 
+from app import cache
 from app.auth import COOKIE, TTL, admin_only, current_user, hash_password, make_token, verify_password
 from app.db import get_db
 from app.enums import Role
@@ -53,12 +54,12 @@ def logout(response: Response):
 
 @router.get("/me")
 def me(db: Session = Depends(get_db), user: User = Depends(current_user)):
-    return _view(db, user)
+    return cache.get_or_set(("users", "me", user.id), lambda: _view(db, user))
 
 
 @router.get("/users", dependencies=[Depends(admin_only)])
 def list_users(db: Session = Depends(get_db)):
-    return [_view(db, u) for u in db.scalars(select(User).order_by(User.username))]
+    return cache.get_or_set(("users", "list"), lambda: [_view(db, u) for u in db.scalars(select(User).order_by(User.username))])
 
 
 @router.post("/users", status_code=201)
